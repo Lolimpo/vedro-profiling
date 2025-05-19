@@ -5,24 +5,26 @@ from collections import defaultdict
 from typing import Optional, Type
 
 import docker
+from matplotlib import pyplot as plt
 from vedro.core import Dispatcher, Plugin, PluginConfig
 from vedro.events import ArgParsedEvent, ArgParseEvent, CleanupEvent, StartupEvent
 
 
 class VedroProfilingPlugin(Plugin):
     """
-    Adds docker profiling support to the framework.
+    Adds docker profiling support to the Vedro framework.
     """
 
     def __init__(self, config: Type["VedroProfiling"]):
         super().__init__(config)
-        self._poll_time = config.poll_time
-        self._enable_profiling = config.enable_profiling
+        self._poll_time: float = config.poll_time
+        self._enable_profiling: bool = config.enable_profiling
+        self._draw_plots: bool = config.draw_plots
         self._stats = defaultdict(lambda: {"CPU": [], "MEM": []})
 
-        self._running = threading.Event()
-        self._thread: Optional[threading.Thread] = None
         self._client = docker.from_env()
+        self._running: bool = False
+        self._thread: Optional[threading.Thread] = None
 
     def subscribe(self, dispatcher: Dispatcher) -> None:
         dispatcher.listen(ArgParseEvent, self.on_arg_parse) \
@@ -36,15 +38,22 @@ class VedroProfilingPlugin(Plugin):
             "--enable-profiling",
             action="store_true",
             default=self._enable_profiling,
-            help="Enable recording of containers status during scenario execution"
+            help="Enable recording of containers stats during scenario execution"
+        )
+        group.add_argument(
+            "--draw-plots",
+            action="store_true",
+            default=self._draw_plots,
+            help="Draw CPU/MEM plots after test run"
         )
 
     def on_arg_parsed(self, event: ArgParsedEvent) -> None:
         self._enable_profiling = event.args.enable_profiling
+        self._draw_plots = event.args.draw_plots
 
     def _collect_stats(self) -> None:
-        while not self._running.is_set():
-            containers = self._client.containers.list()
+        containers = self._client.containers.list()
+        while self._running:
             for container in containers:
                 stats = container.stats(decode=None, stream=False)
 
@@ -63,23 +72,55 @@ class VedroProfilingPlugin(Plugin):
             time.sleep(self._poll_time)
 
     def on_startup(self, event: StartupEvent) -> None:
-        if self._enable_profiling:
-            if not self._client.containers.list():
-                raise RuntimeError("No running containers found for profiling.")
+        if not self._enable_profiling:
+            return
 
-            self._running.clear()
-            self._thread = threading.Thread(target=self._collect_stats)
-            self._thread.daemon = True
-            self._thread.start()
+        if not self._client.containers.list():
+            raise RuntimeError("No running containers found for profiling.")
+
+        self._running = True
+        self._thread = threading.Thread(target=self._collect_stats, daemon=True)
+        self._thread.start()
+
+    def _generate_plots(self) -> None:
+        for name, metrics in self._stats.items():
+            ticks = list(range(len(metrics["CPU"])))
+
+            # CPU plot
+            plt.figure()
+            plt.plot(ticks, metrics["CPU"], label="CPU (%)")
+            plt.xlabel("Tick")
+            plt.ylabel("CPU Usage (%)")
+            plt.title(f"{name} - CPU Usage")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"{name}_cpu.png")
+            plt.close()
+
+            # Memory plot
+            plt.figure()
+            plt.plot(ticks, metrics["MEM"], label="Memory (MB)")
+            plt.xlabel("Tick")
+            plt.ylabel("Memory Usage (MB)")
+            plt.title(f"{name} - Memory Usage")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"{name}_mem.png")
+            plt.close()
 
     def on_cleanup(self, event: CleanupEvent) -> None:
-        if self._enable_profiling:
-            if self._thread and self._thread.is_alive():
-                self._running.set()
-                self._thread.join(timeout=2.0)
-            with open("./profiling.log", "w") as profiling_log:
-                json.dump(dict(self._stats), profiling_log, indent=2)
+        if not self._enable_profiling:
+            return
 
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join()
+
+        with open("./profiling.log", "w") as profiling_log:
+            json.dump(dict(self._stats), profiling_log, indent=2)
+
+        if self._draw_plots:
+            self._generate_plots()
 
 class VedroProfiling(PluginConfig):
     plugin = VedroProfilingPlugin
