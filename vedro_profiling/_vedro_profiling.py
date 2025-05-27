@@ -2,7 +2,7 @@ import json
 import threading
 import time
 from collections import defaultdict
-from typing import Optional, Type
+from typing import Any, DefaultDict, Optional, Type
 
 import docker
 from matplotlib import pyplot as plt
@@ -20,7 +20,7 @@ class VedroProfilingPlugin(Plugin):
         self._poll_time: float = config.poll_time
         self._enable_profiling: bool = config.enable_profiling
         self._draw_plots: bool = config.draw_plots
-        self._stats = defaultdict(lambda: {"CPU": [], "MEM": []})
+        self._stats: DefaultDict[str, Any] = defaultdict(lambda: {"CPU": [], "MEM": []})
 
         self._client = docker.from_env()
         self._running: bool = False
@@ -121,6 +121,7 @@ class VedroProfilingPlugin(Plugin):
 
         if self._draw_plots:
             self._generate_plots()
+
 
 class VedroProfiling(PluginConfig):
     plugin = VedroProfilingPlugin
