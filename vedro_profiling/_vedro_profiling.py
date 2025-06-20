@@ -20,6 +20,7 @@ class VedroProfilingPlugin(Plugin):
         self._poll_time: float = config.poll_time
         self._enable_profiling: bool = config.enable_profiling
         self._draw_plots: bool = config.draw_plots
+        self._docker_compose_project_name: str = config.docker_compose_project_name
         self._stats: DefaultDict[str, Any] = defaultdict(lambda: {"CPU": [], "MEM": []})
 
         self._client = docker.from_env()
@@ -52,7 +53,9 @@ class VedroProfilingPlugin(Plugin):
         self._draw_plots = event.args.draw_plots
 
     def _collect_stats(self) -> None:
-        containers = self._client.containers.list()
+        containers = self._client.containers.list(
+            filters={"name": self._docker_compose_project_name}
+        )
         while self._running:
             for container in containers:
                 stats = container.stats(decode=None, stream=False)
@@ -134,3 +137,6 @@ class VedroProfiling(PluginConfig):
 
     # Poll time for stats in seconds
     poll_time: float = 1.0
+
+    # Docker Compose project name used for container profiling
+    docker_compose_project_name: str = "compose"

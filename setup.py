@@ -16,7 +16,7 @@ def find_dev_required():
 setup(
     name="vedro-profiling",
     version=version,
-    description="Vedro plugin for measuring docker resource usage.",
+    description="Vedro plugin for measuring resource usage of tests",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Nikita Mikheev",
