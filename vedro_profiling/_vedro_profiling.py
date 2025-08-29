@@ -1,10 +1,12 @@
 import json
+import os
 import threading
 import time
 from collections import defaultdict
 from typing import Any, DefaultDict, Optional, Type
 
 import docker
+import psutil
 from matplotlib import pyplot as plt
 from vedro.core import Dispatcher, Plugin, PluginConfig
 from vedro.events import ArgParsedEvent, ArgParseEvent, CleanupEvent, StartupEvent
@@ -12,7 +14,7 @@ from vedro.events import ArgParsedEvent, ArgParseEvent, CleanupEvent, StartupEve
 
 class VedroProfilingPlugin(Plugin):
     """
-    Adds docker profiling support to the Vedro framework.
+    Adds profiling support to the Vedro framework.
     """
 
     def __init__(self, config: Type["VedroProfiling"]):
@@ -23,7 +25,6 @@ class VedroProfilingPlugin(Plugin):
         self._docker_compose_project_name: str = config.docker_compose_project_name
         self._stats: DefaultDict[str, Any] = defaultdict(lambda: {"CPU": [], "MEM": []})
 
-        self._client = docker.from_env()
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
 
@@ -52,10 +53,20 @@ class VedroProfilingPlugin(Plugin):
         self._enable_profiling = event.args.enable_profiling
         self._draw_plots = event.args.draw_plots
 
-    def _collect_stats(self) -> None:
-        containers = self._client.containers.list(
-            filters={"name": self._docker_compose_project_name}
+    def _collect_docker_stats(self) -> None:
+        client = docker.from_env()
+
+        containers = client.containers.list(
+            filters={
+                "label": [
+                    "com.docker.compose.project=" + self._docker_compose_project_name
+                ]
+            }
         )
+        if not containers:
+            if not client.containers.list():
+                raise RuntimeError("No running containers found for profiling.")
+
         while self._running:
             for container in containers:
                 stats = container.stats(decode=None, stream=False)
@@ -74,15 +85,25 @@ class VedroProfilingPlugin(Plugin):
                 self._stats[container.name]["MEM"].append(mem / 1e6)  # in MB
             time.sleep(self._poll_time)
 
+    def _collect_psutil_stats(self) -> None:
+        proc = psutil.Process(os.getpid())
+
+        cpu = proc.cpu_percent(interval=self._poll_time)
+        memory = proc.memory_info().rss / 1024 / 1024  # в MB
+        io_counters = proc.io_counters()
+
+        print(f"CPU: {cpu}%")
+        print(f"Memory: {memory:.2f} MB")
+        print(f"Disk read: {io_counters.read_bytes / 1024 / 1024:.2f} MB")
+        print(f"Disk write: {io_counters.write_bytes / 1024 / 1024:.2f} MB")
+
     def on_startup(self, event: StartupEvent) -> None:
         if not self._enable_profiling:
             return
 
-        if not self._client.containers.list():
-            raise RuntimeError("No running containers found for profiling.")
-
         self._running = True
-        self._thread = threading.Thread(target=self._collect_stats, daemon=True)
+        # self._thread = threading.Thread(target=self._collect_docker_stats, daemon=True)
+        self._thread = threading.Thread(target=self._collect_psutil_stats, daemon=True)
         self._thread.start()
 
     def _generate_plots(self) -> None:
