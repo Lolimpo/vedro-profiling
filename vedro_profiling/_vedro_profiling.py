@@ -1,31 +1,38 @@
 import json
+import os
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime
 from typing import Any, DefaultDict, Optional, Type
+import warnings
 
 import docker
-from matplotlib import pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import psutil
+from docker import errors as docker_errors
 from vedro.core import Dispatcher, Plugin, PluginConfig
 from vedro.events import ArgParsedEvent, ArgParseEvent, CleanupEvent, StartupEvent
 
 
 class VedroProfilingPlugin(Plugin):
     """
-    Adds docker profiling support to the Vedro framework.
+    Adds profiling support to the Vedro framework.
     """
 
     def __init__(self, config: Type["VedroProfiling"]):
         super().__init__(config)
-        self._poll_time: float = config.poll_time
         self._enable_profiling: bool = config.enable_profiling
+        self._poll_time: float = config.poll_time
+        self._profiling_methods: list[str] = config.profiling_methods
         self._draw_plots: bool = config.draw_plots
         self._docker_compose_project_name: str = config.docker_compose_project_name
-        self._stats: DefaultDict[str, Any] = defaultdict(lambda: {"CPU": [], "MEM": []})
+        self._stats: DefaultDict[str, Any] = defaultdict(lambda: {"CPU": [], "MEM": [], "timestamps": []})
 
-        self._client = docker.from_env()
         self._running: bool = False
-        self._thread: Optional[threading.Thread] = None
+        self._docker_thread: Optional[threading.Thread] = None
+        self._psutil_thread: Optional[threading.Thread] = None
 
     def subscribe(self, dispatcher: Dispatcher) -> None:
         dispatcher.listen(ArgParseEvent, self.on_arg_parse) \
@@ -52,75 +59,212 @@ class VedroProfilingPlugin(Plugin):
         self._enable_profiling = event.args.enable_profiling
         self._draw_plots = event.args.draw_plots
 
-    def _collect_stats(self) -> None:
-        containers = self._client.containers.list(
-            filters={"name": self._docker_compose_project_name}
+    def _collect_docker_stats(self) -> None:
+        try:
+            client = docker.from_env()
+        except docker_errors.DockerException:
+            warnings.warn("Docker is unavailable, containers metrics are disabled.")
+            return
+
+        containers = client.containers.list(
+            filters={
+                "label": [
+                    "com.docker.compose.project=" + self._docker_compose_project_name
+                ]
+            }
         )
+        if not containers:
+            warnings.warn("No containers found for profiling.")
+            return
+
         while self._running:
             for container in containers:
-                stats = container.stats(decode=None, stream=False)
+                try:
+                    stats = container.stats(decode=None, stream=False)
 
-                cpu_delta = (stats["cpu_stats"]["cpu_usage"]["total_usage"] -
-                             stats["precpu_stats"]["cpu_usage"]["total_usage"])
-                system_delta = (stats["cpu_stats"]["system_cpu_usage"] -
-                                stats["precpu_stats"]["system_cpu_usage"])
+                    cpu_delta = (stats["cpu_stats"]["cpu_usage"]["total_usage"] -
+                               stats["precpu_stats"]["cpu_usage"]["total_usage"])
+                    system_delta = (stats["cpu_stats"]["system_cpu_usage"] -
+                                  stats["precpu_stats"]["system_cpu_usage"])
 
-                if system_delta > 0 and stats["cpu_stats"].get("online_cpus"):
-                    cpu_percent = ((cpu_delta / system_delta) *
-                                   stats["cpu_stats"]["online_cpus"] * 100)
-                    self._stats[container.name]["CPU"].append(cpu_percent)
+                    if system_delta > 0 and stats["cpu_stats"].get("online_cpus"):
+                        cpu_percent = ((cpu_delta / system_delta) *
+                                     stats["cpu_stats"]["online_cpus"] * 100)
+                        self._stats[container.name]["CPU"].append(cpu_percent)
 
-                mem = stats["memory_stats"]["usage"]
-                self._stats[container.name]["MEM"].append(mem / 1e6)  # in MB
+                    mem = stats["memory_stats"]["usage"]
+                    self._stats[container.name]["MEM"].append(mem / 1e6)  # in MB
+                    
+                    timestamp = datetime.now().isoformat()
+                    self._stats[container.name]["timestamps"].append(timestamp)
+                except (KeyError, docker_errors.APIError):
+                    continue
+
+            time.sleep(self._poll_time)
+
+    def _collect_psutil_stats(self) -> None:
+        proc = psutil.Process()
+
+        while self._running:
+            proc_cpu = proc.cpu_percent()
+            proc_mem = proc.memory_percent()
+
+            system_cpu = psutil.cpu_percent()
+            system_mem = psutil.virtual_memory().percent
+
+            timestamp = datetime.now().isoformat()
+            
+            self._stats[proc.name()]["CPU"].append(proc_cpu)
+            self._stats["system"]["CPU"].append(system_cpu)
+            self._stats[proc.name()]["MEM"].append(proc_mem)
+            self._stats["system"]["MEM"].append(system_mem)
+            
+            self._stats[proc.name()]["timestamps"].append(timestamp)
+            self._stats["system"]["timestamps"].append(timestamp)
+
             time.sleep(self._poll_time)
 
     def on_startup(self, event: StartupEvent) -> None:
         if not self._enable_profiling:
             return
 
-        if not self._client.containers.list():
-            raise RuntimeError("No running containers found for profiling.")
-
         self._running = True
-        self._thread = threading.Thread(target=self._collect_stats, daemon=True)
-        self._thread.start()
+
+        if "default" in self._profiling_methods:
+            self._psutil_thread = threading.Thread(target=self._collect_psutil_stats, daemon=True)
+            self._psutil_thread.start()
+
+        if "docker" in self._profiling_methods:
+            self._docker_thread = threading.Thread(target=self._collect_docker_stats, daemon=True)
+            self._docker_thread.start()
+
+    def _ensure_profiling_dir(self) -> str:
+        profiling_dir = ".profiling"
+        os.makedirs(profiling_dir, exist_ok=True)
+        return profiling_dir
 
     def _generate_plots(self) -> None:
+        if not self._stats:
+            return
+
+        plt.style.use('default')
+        profiling_dir = self._ensure_profiling_dir()
+        
         for name, metrics in self._stats.items():
-            ticks = list(range(len(metrics["CPU"])))
+            if not metrics["CPU"] and not metrics["MEM"]:
+                continue
+                
+            self._create_individual_plot(name, metrics, profiling_dir)
+        
+        if len(self._stats) > 1:
+            self._create_comparison_plot(profiling_dir)
+    
+    def _create_individual_plot(self, name: str, metrics: dict[str, list[float]], profiling_dir: str) -> None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        
+        timestamps = [datetime.fromisoformat(str(ts)) for ts in metrics["timestamps"]]
+        
+        if metrics["CPU"]:
+            ax1.plot(timestamps, metrics["CPU"], 'b-', linewidth=2, label='CPU Usage')
+            ax1.set_ylabel('CPU Usage (%)', fontsize=12)
+            ax1.set_title(f'{name} - Resource Usage Over Time', fontsize=14, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            
+            cpu_stats = self._calculate_stats(metrics["CPU"])
+            stats_text = f'Avg: {cpu_stats["avg"]:.1f}% | Max: {cpu_stats["max"]:.1f}%'
+            ax1.text(0.02, 0.95, stats_text, transform=ax1.transAxes, 
+                    fontsize=9, verticalalignment='top')
+        
+        if metrics["MEM"]:
+            ax2.plot(timestamps, metrics["MEM"], 'r-', linewidth=2, label='Memory Usage')
+            ax2.set_ylabel('Memory Usage (%)' if name == 'system' else 'Memory Usage (MB)', fontsize=12)
+            ax2.set_xlabel('Time', fontsize=12)
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+            
+            mem_stats = self._calculate_stats(metrics["MEM"])
+            stats_text = f'Avg: {mem_stats["avg"]:.1f} | Max: {mem_stats["max"]:.1f}'
+            ax2.text(0.02, 0.95, stats_text, transform=ax2.transAxes,
+                    fontsize=9, verticalalignment='top')
+        
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))  # type: ignore[no-untyped-call]
+        ax2.xaxis.set_major_locator(mdates.SecondLocator(interval=max(1, len(timestamps)//10)))  # type: ignore[no-untyped-call]
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+        
+        plt.tight_layout()
+        plot_path = os.path.join(profiling_dir, f'{name}_profile.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    def _create_comparison_plot(self, profiling_dir: str) -> None:
+        _, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        
+        colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
+        
+        for i, (name, metrics) in enumerate(self._stats.items()):
+            if not metrics["CPU"] and not metrics["MEM"]:
+                continue
+                
+            timestamps = [datetime.fromisoformat(ts) for ts in metrics["timestamps"]]
+            
+            if metrics["CPU"]:
+                ax1.plot(timestamps, metrics["CPU"], color=colors[i % len(colors)], 
+                        linewidth=2, label=f'{name} CPU')
+            
+            if metrics["MEM"]:
+                ax2.plot(timestamps, metrics["MEM"], color=colors[i % len(colors)], 
+                        linewidth=2, label=f'{name} Memory', linestyle='--')
+        
+        ax1.set_ylabel('CPU Usage (%)', fontsize=12)
+        ax1.set_title('Resource Usage Comparison', fontsize=16, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        ax2.set_ylabel('Memory Usage', fontsize=12)
+        ax2.set_xlabel('Time', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        if self._stats:
+            first_timestamps = [datetime.fromisoformat(ts) for ts in list(self._stats.values())[0]["timestamps"]]
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))  # type: ignore[no-untyped-call]
+            ax2.xaxis.set_major_locator(mdates.SecondLocator(interval=max(1, len(first_timestamps)//10)))  # type: ignore[no-untyped-call]
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
 
-            # CPU plot
-            plt.figure()
-            plt.plot(ticks, metrics["CPU"], label="CPU (%)")
-            plt.xlabel("Tick")
-            plt.ylabel("CPU Usage (%)")
-            plt.title(f"{name} - CPU Usage")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(f"{name}_cpu.png")
-            plt.close()
-
-            # Memory plot
-            plt.figure()
-            plt.plot(ticks, metrics["MEM"], label="Memory (MB)")
-            plt.xlabel("Tick")
-            plt.ylabel("Memory Usage (MB)")
-            plt.title(f"{name} - Memory Usage")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(f"{name}_mem.png")
-            plt.close()
+        plt.tight_layout()
+        plot_path = os.path.join(profiling_dir, 'resource_comparison.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    def _calculate_stats(self, data: list[float]) -> dict[str, float]:
+        if not data:
+            return {"avg": 0, "max": 0, "min": 0}
+        
+        return {
+            "avg": sum(data) / len(data),
+            "max": max(data),
+            "min": min(data)
+        }
 
     def on_cleanup(self, event: CleanupEvent) -> None:
         if not self._enable_profiling:
             return
 
         self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join()
 
-        with open("./profiling.log", "w") as profiling_log:
-            json.dump(dict(self._stats), profiling_log, indent=2)
+        if self._docker_thread and self._docker_thread.is_alive():
+            self._docker_thread.join(timeout=5.0)
+        if self._psutil_thread and self._psutil_thread.is_alive():
+            self._psutil_thread.join(timeout=5.0)
+
+        try:
+            profiling_dir = self._ensure_profiling_dir()
+            log_path = os.path.join(profiling_dir, "profiling.log")
+            with open(log_path, "w") as profiling_log:
+                json.dump(dict(self._stats), profiling_log, indent=2)
+        except Exception:
+            pass
 
         if self._draw_plots:
             self._generate_plots()
@@ -132,11 +276,14 @@ class VedroProfiling(PluginConfig):
     # Enable stats collection
     enable_profiling: bool = False
 
-    # Enable plots drawing for given profile snapshot
-    draw_plots: bool = False
+    # Supported profiling methods
+    profiling_methods: list[str] = ["default", "docker"]
 
     # Poll time for stats in seconds
     poll_time: float = 1.0
+
+    # Enable plots drawing for given profile snapshot
+    draw_plots: bool = False
 
     # Docker Compose project name used for container profiling
     docker_compose_project_name: str = "compose"
