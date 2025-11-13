@@ -113,10 +113,10 @@ class VedroProfilingPlugin(Plugin):
         while not self._stop_event.is_set():
             try:
                 proc_cpu = proc.cpu_percent()
-                proc_mem = proc.memory_percent()
+                proc_mem = proc.memory_info().rss / 1e6  # Memory in MB
 
                 system_cpu = psutil.cpu_percent()
-                system_mem = psutil.virtual_memory().percent
+                system_mem = psutil.virtual_memory().used / 1e6  # Memory in MB
 
                 timestamp = datetime.now().isoformat()
 
@@ -206,24 +206,24 @@ class VedroProfilingPlugin(Plugin):
 
         if metrics["MEM"]:
             ax2.plot(timestamps, metrics["MEM"], 'r-', linewidth=2, label='Memory Usage')
-            mem_label = 'Memory Usage (%)' if name == 'system' else 'Memory Usage (MB)'
+            mem_label = 'Memory Usage (MB)'
             ax2.set_ylabel(mem_label, fontsize=12)
             ax2.set_xlabel('Time', fontsize=12)
             ax2.grid(True, alpha=0.3)
             ax2.legend()
 
             mem_stats = self._calculate_stats(metrics["MEM"])
-            stats_text = f'Avg: {mem_stats["avg"]:.1f} | Max: {mem_stats["max"]:.1f}'
+            stats_text = f'Avg: {mem_stats["avg"]:.1f} MB | Max: {mem_stats["max"]:.1f} MB'
             ax2.text(
                 0.02, 0.95, stats_text, transform=ax2.transAxes,
                 fontsize=9, verticalalignment='top'
             )
 
         ax2.xaxis.set_major_formatter(
-            mdates.DateFormatter('%H:%M:%S')  # type: ignore[no-untyped-call]
+            mdates.DateFormatter('%H:%M:%S')
         )
         ax2.xaxis.set_major_locator(
-            mdates.SecondLocator(  # type: ignore[no-untyped-call]
+            mdates.SecondLocator(
                 interval=max(1, len(timestamps) // 10)
             )
         )
