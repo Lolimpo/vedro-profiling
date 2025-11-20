@@ -220,10 +220,10 @@ class VedroProfilingPlugin(Plugin):
             )
 
         ax2.xaxis.set_major_formatter(
-            mdates.DateFormatter('%H:%M:%S')
+            mdates.DateFormatter('%H:%M:%S')  # type: ignore[no-untyped-call]
         )
         ax2.xaxis.set_major_locator(
-            mdates.SecondLocator(
+            mdates.SecondLocator(  # type: ignore[no-untyped-call]
                 interval=max(1, len(timestamps) // 10)
             )
         )
