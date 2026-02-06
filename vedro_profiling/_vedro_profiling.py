@@ -4,7 +4,7 @@ import threading
 import warnings
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Type
+from typing import Any, Type, TypedDict
 
 import docker
 import matplotlib.dates as mdates
@@ -13,6 +13,25 @@ import psutil
 from docker import errors as docker_errors
 from vedro.core import Dispatcher, Plugin, PluginConfig
 from vedro.events import ArgParsedEvent, ArgParseEvent, CleanupEvent, StartupEvent
+
+
+# Type aliases for better type safety
+class DataPointData(TypedDict):
+    """Data structure for a profiling data point."""
+    time: str
+    value: float
+    tags: dict[str, str]
+
+
+class DataPoint(TypedDict):
+    """Complete data point structure for profiling metrics."""
+    type: str
+    metric: str
+    data: DataPointData
+
+
+MetricStats = dict[str, list[Any]]  # Contains CPU, MEM lists and timestamps
+StatsDict = dict[str, MetricStats]
 
 
 class VedroProfilingPlugin(Plugin):
@@ -31,7 +50,7 @@ class VedroProfilingPlugin(Plugin):
         self._additional_tags: dict[str, str] = config.additional_tags
         
         # New data structure for k6-compatible format
-        self._data_points: list[dict[str, Any]] = []
+        self._data_points: list[DataPoint] = []
         self._metrics_definitions: dict[str, dict[str, str]] = {
             "cpu_percent": {"type": "gauge", "unit": "percent"},
             "memory_usage": {"type": "gauge", "unit": "megabytes"}
@@ -76,6 +95,33 @@ class VedroProfilingPlugin(Plugin):
         if event.args.run_id:
             self._profiling_run_id = event.args.run_id
 
+    def _create_data_point(
+        self,
+        metric: str,
+        value: float,
+        target: str,
+        method: str,
+        timestamp: str | None = None
+    ) -> DataPoint:
+        """Create a standardized data point for profiling metrics."""
+        if timestamp is None:
+            timestamp = datetime.now().isoformat() + "Z"
+        
+        return {
+            "type": "Point",
+            "metric": metric,
+            "data": {
+                "time": timestamp,
+                "value": value,
+                "tags": {
+                    "target": target,
+                    "method": method,
+                    "run": self._run_id,
+                    **self._additional_tags
+                }
+            }
+        }
+
     def _collect_docker_stats(self) -> None:
         try:
             client = docker.from_env()
@@ -101,6 +147,7 @@ class VedroProfilingPlugin(Plugin):
 
                 try:
                     stats_raw = container.stats(decode=None, stream=False)
+                    # Stats structure: {"cpu_stats": {...}, "memory_stats": {...}, "precpu_stats": {...}}
                     stats: dict[str, Any] = stats_raw  # type: ignore[assignment]
 
                     cpu_delta = (stats["cpu_stats"]["cpu_usage"]["total_usage"] -
@@ -109,45 +156,36 @@ class VedroProfilingPlugin(Plugin):
                                     stats["precpu_stats"]["system_cpu_usage"])
 
                     timestamp = datetime.now().isoformat() + "Z"
+                    container_name = container.name or "unknown"
                     
                     if system_delta > 0 and stats["cpu_stats"].get("online_cpus"):
                         cpu_percent = ((cpu_delta / system_delta) *
                                        stats["cpu_stats"]["online_cpus"] * 100)
                         
                         # CPU point
-                        self._data_points.append({
-                            "type": "Point",
-                            "metric": "cpu_percent",
-                            "data": {
-                                "time": timestamp,
-                                "value": cpu_percent,
-                                "tags": {
-                                    "target": container.name,
-                                    "method": "docker",
-                                    "run": self._run_id,
-                                    **self._additional_tags
-                                }
-                            }
-                        })
+                        self._data_points.append(
+                            self._create_data_point(
+                                metric="cpu_percent",
+                                value=cpu_percent,
+                                target=container_name,
+                                method="docker",
+                                timestamp=timestamp
+                            )
+                        )
 
                     mem = stats["memory_stats"]["usage"]
                     mem_mb = mem / 1e6
                     
                     # Memory point
-                    self._data_points.append({
-                        "type": "Point",
-                        "metric": "memory_usage",
-                        "data": {
-                            "time": timestamp,
-                            "value": mem_mb,
-                            "tags": {
-                                "target": container.name,
-                                "method": "docker",
-                                "run": self._run_id,
-                                **self._additional_tags
-                            }
-                        }
-                    })
+                    self._data_points.append(
+                        self._create_data_point(
+                            metric="memory_usage",
+                            value=mem_mb,
+                            target=container_name,
+                            method="docker",
+                            timestamp=timestamp
+                        )
+                    )
                 except (KeyError, docker_errors.APIError):
                     continue
 
@@ -165,70 +203,51 @@ class VedroProfilingPlugin(Plugin):
                 system_mem = psutil.virtual_memory().used / 1e6  # Memory in MB
 
                 timestamp = datetime.now().isoformat() + "Z"
+                proc_name = proc.name() or "unknown"
 
                 # Process CPU point
-                self._data_points.append({
-                    "type": "Point",
-                    "metric": "cpu_percent",
-                    "data": {
-                        "time": timestamp,
-                        "value": proc_cpu,
-                        "tags": {
-                            "target": proc.name(),
-                            "method": "default",
-                            "run": self._run_id,
-                            **self._additional_tags
-                        }
-                    }
-                })
+                self._data_points.append(
+                    self._create_data_point(
+                        metric="cpu_percent",
+                        value=proc_cpu,
+                        target=proc_name,
+                        method="default",
+                        timestamp=timestamp
+                    )
+                )
                 
                 # Process memory point
-                self._data_points.append({
-                    "type": "Point",
-                    "metric": "memory_usage",
-                    "data": {
-                        "time": timestamp,
-                        "value": proc_mem,
-                        "tags": {
-                            "target": proc.name(),
-                            "method": "default",
-                            "run": self._run_id,
-                            **self._additional_tags
-                        }
-                    }
-                })
+                self._data_points.append(
+                    self._create_data_point(
+                        metric="memory_usage",
+                        value=proc_mem,
+                        target=proc_name,
+                        method="default",
+                        timestamp=timestamp
+                    )
+                )
                 
                 # System CPU point
-                self._data_points.append({
-                    "type": "Point",
-                    "metric": "cpu_percent",
-                    "data": {
-                        "time": timestamp,
-                        "value": system_cpu,
-                        "tags": {
-                            "target": "system",
-                            "method": "default",
-                            "run": self._run_id,
-                            **self._additional_tags
-                        }
-                    }
-                })
+                self._data_points.append(
+                    self._create_data_point(
+                        metric="cpu_percent",
+                        value=system_cpu,
+                        target="system",
+                        method="default",
+                        timestamp=timestamp
+                    )
+                )
                 
                 # System memory point
-                self._data_points.append({
-                    "type": "Point",
-                    "metric": "memory_usage",
-                    "data": {
-                        "time": timestamp,
-                        "value": system_mem,
-                        "tags": {
-                            "target": "system",
-                            "method": "default",
-                            "run": self._run_id,
-                            **self._additional_tags
-                        }
-                    }
-                })
+                self._data_points.append(
+                    self._create_data_point(
+                        metric="memory_usage",
+                        value=system_mem,
+                        target="system",
+                        method="default",
+                        timestamp=timestamp
+                    )
+                )
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 break
 
@@ -287,9 +306,9 @@ class VedroProfilingPlugin(Plugin):
             for point in self._data_points:
                 f.write(json.dumps(point) + "\n")
 
-    def _prepare_stats_for_plotting(self) -> dict[str, dict[str, list[Any]]]:
+    def _prepare_stats_for_plotting(self) -> StatsDict:
         """Convert data points to format for plotting"""
-        stats: dict[str, dict[str, list[Any]]] = defaultdict(
+        stats: StatsDict = defaultdict(
             lambda: {"CPU": [], "MEM": [], "timestamps": []}
         )
         
@@ -328,7 +347,7 @@ class VedroProfilingPlugin(Plugin):
     def _create_individual_plot(
         self,
         name: str,
-        metrics: dict[str, list[float]],
+        metrics: MetricStats,
         profiling_dir: str
     ) -> None:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
@@ -385,7 +404,7 @@ class VedroProfilingPlugin(Plugin):
 
     def _create_comparison_plot_from_stats(
         self,
-        stats: dict[str, dict[str, list[Any]]],
+        stats: StatsDict,
         profiling_dir: str
     ) -> None:
         _, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
@@ -466,11 +485,16 @@ class VedroProfilingPlugin(Plugin):
 
         try:
             self._write_profiling_log()
-        except Exception:
-            pass
+        except (IOError, OSError) as e:
+            warnings.warn(f"Failed to write profiling log: {e}")
+        except Exception as e:
+            warnings.warn(f"Unexpected error writing profiling log: {e}")
 
         if self._draw_plots:
-            self._generate_plots()
+            try:
+                self._generate_plots()
+            except Exception as e:
+                warnings.warn(f"Failed to generate plots: {e}")
 
 
 class VedroProfiling(PluginConfig):
@@ -480,7 +504,7 @@ class VedroProfiling(PluginConfig):
     enable_profiling: bool = False
 
     # Supported profiling methods
-    profiling_methods: list[str] = ["default", "docker"]
+    profiling_methods: list[str] = ["default"]
 
     # Poll time for stats in seconds
     poll_time: float = 1.0
