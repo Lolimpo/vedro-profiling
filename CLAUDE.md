@@ -10,7 +10,7 @@ This document provides comprehensive guidance for AI assistants working on the v
 - **PyPI Package**: vedro-profiling
 - **Current Version**: 0.1.2
 - **License**: Apache 2.0
-- **Python Support**: 3.10, 3.11, 3.12, 3.13
+- **Python Support**: 3.10, 3.11, 3.12, 3.13, 3.14
 
 ## Architecture
 
@@ -42,9 +42,9 @@ The main plugin class that implements profiling functionality. Key responsibilit
 
 - **Event Handling**: Subscribes to Vedro lifecycle events (ArgParse, ArgParsed, Startup, Cleanup)
 - **Data Collection**: Runs background threads to collect CPU and memory statistics
-- **Statistics Storage**: Maintains metrics in a defaultdict structure
+- **Statistics Storage**: Maintains metrics as data points in a list structure
 - **Visualization**: Generates matplotlib plots and comparison charts
-- **Logging**: Saves profiling data as JSON
+- **Logging**: Saves profiling data in k6-compatible NDJSON format
 
 #### 2. VedroProfiling Configuration (`_vedro_profiling.py:326-343`)
 
@@ -58,6 +58,8 @@ class VedroProfiling(PluginConfig):
     poll_time: float = 1.0
     draw_plots: bool = False
     docker_compose_project_name: str = "compose"
+    profiling_run_id: Optional[str] = None
+    additional_tags: dict[str, str] = {}
 ```
 
 ### Key Features
@@ -81,12 +83,21 @@ class VedroProfiling(PluginConfig):
 - Non-daemon threads ensure proper cleanup on interruption
 - Poll interval configurable via `poll_time` (default: 1.0 seconds)
 - Thread-safe stop mechanism using `threading.Event`
+- Data stored as list of data points with full metadata and tags
+- Each data point includes: metric name, timestamp, value, and tags (target, method, run, custom)
 
 #### Output
 
-1. **JSON Logs** (`.profiling/profiling.log`)
-   - Complete statistics dump with timestamps
-   - Structure: `{container/process_name: {CPU: [], MEM: [], timestamps: []}}`
+1. **NDJSON Logs** (`.profiling/profiling.ndjson`)
+   - k6-compatible newline-delimited JSON format
+   - Metric definitions followed by data points
+   - Structure: Each line is a separate JSON object (either Metric or Point type)
+   - Tags for filtering: `target`, `method`, `run`, and custom tags
+   - Example:
+     ```json
+     {"type":"Metric","metric":"cpu_percent","data":{"type":"gauge","unit":"percent"}}
+     {"type":"Point","metric":"cpu_percent","data":{"time":"2026-01-26T10:00:00.123Z","value":25.5,"tags":{"target":"app-1","method":"docker","run":"test-123"}}}
+     ```
 
 2. **Visualization Plots** (`.profiling/`)
    - Individual plots per container/process (`{name}_profile.png`)
@@ -251,11 +262,28 @@ self._stop_event.wait(timeout)  # Poll with timeout
 ### 3. Statistics Collection Pattern
 
 ```python
-from collections import defaultdict
+# New k6-compatible data structure
+self._data_points: list[dict[str, Any]] = []
+self._metrics_definitions: dict[str, dict[str, str]] = {
+    "cpu_percent": {"type": "gauge", "unit": "percent"},
+    "memory_usage": {"type": "gauge", "unit": "megabytes"}
+}
 
-self._stats: DefaultDict[str, Any] = defaultdict(
-    lambda: {"CPU": [], "MEM": [], "timestamps": []}
-)
+# Data point example
+data_point = {
+    "type": "Point",
+    "metric": "cpu_percent",
+    "data": {
+        "time": "2026-01-26T10:00:00.123Z",
+        "value": 25.5,
+        "tags": {
+            "target": "container-name",
+            "method": "docker",
+            "run": "run-20260126-100000",
+            **additional_tags
+        }
+    }
+}
 ```
 
 ### 4. Docker Container Filtering
@@ -286,12 +314,18 @@ class Config(vedro.Config):
             poll_time = 1.0
             draw_plots = True
             docker_compose_project_name = "your-project-name"
+            profiling_run_id = "load-test-2026-01-26"  # Optional custom run ID
+            additional_tags = {  # Optional custom tags
+                "env": "staging",
+                "team": "performance"
+            }
 ```
 
 ### CLI Arguments
 
 - `--enable-profiling`: Enable profiling for this run
 - `--draw-plots`: Generate visualization plots
+- `--run-id <id>`: Set custom run identifier (default: auto-generated timestamp)
 
 ## Common Development Tasks
 
@@ -301,13 +335,30 @@ class Config(vedro.Config):
 2. Create `_collect_{method}_stats` method following the pattern
 3. Add thread initialization in `on_startup`
 4. Add thread cleanup in `on_cleanup`
-5. Ensure statistics use the standard format: `{"CPU": [], "MEM": [], "timestamps": []}`
+5. Ensure data points are generated with proper structure:
+   ```python
+   self._data_points.append({
+       "type": "Point",
+       "metric": "cpu_percent" or "memory_usage",
+       "data": {
+           "time": datetime.now().isoformat() + "Z",
+           "value": <numeric_value>,
+           "tags": {
+               "target": <target_name>,
+               "method": <method_name>,
+               "run": self._run_id,
+               **self._additional_tags
+           }
+       }
+   })
+   ```
 
 ### Modifying Plot Generation
 
-- Individual plots: `_create_individual_plot` (`_vedro_profiling.py:179-236`)
-- Comparison plots: `_create_comparison_plot` (`_vedro_profiling.py:237-290`)
-- Statistics: `_calculate_stats` (`_vedro_profiling.py:292-300`)
+- Data preparation: `_prepare_stats_for_plotting` - converts data points to plotting format
+- Individual plots: `_create_individual_plot` - generates per-target plots
+- Comparison plots: `_create_comparison_plot_from_stats` - generates multi-target comparison
+- Statistics: `_calculate_stats` - calculates avg/max/min statistics
 
 ### Adding Configuration Options
 
@@ -373,6 +424,8 @@ Follow conventional commit style based on repository history:
 5. **Update version**: Modify `pyproject.toml` version for releases
 6. **Non-daemon threads**: Don't change thread daemon status
 7. **Preserve event patterns**: Follow existing Vedro event subscription patterns
+8. **NDJSON format**: All data points must follow k6-compatible structure with proper tags
+9. **Tags consistency**: Always include target, method, and run tags in data points
 
 ### Before Making Changes
 
@@ -387,8 +440,10 @@ Follow conventional commit style based on repository history:
 1. Run `make lint` before committing
 2. Test with and without Docker available
 3. Verify plots are generated correctly
-4. Check JSON log format remains consistent
-5. Test thread cleanup (interruption handling)
+4. Check NDJSON log format is valid (each line is valid JSON)
+5. Verify all data points include required tags (target, method, run)
+6. Test thread cleanup (interruption handling)
+7. Validate compatibility with k6/monitoring tools if possible
 
 ### Documentation Updates
 
@@ -408,19 +463,24 @@ When changing functionality:
 
 ## Project-Specific Notes
 
-### Recent Changes (as of v0.1.2)
+### Recent Changes (as of v0.2.0)
 
+- **BREAKING**: Log format changed from JSON to k6-compatible NDJSON
+- **NEW**: Support for custom run IDs and additional tags
+- **NEW**: Data points include full metadata and tags for filtering
 - Memory metrics now displayed in MB (previously in bytes)
 - Threads changed to non-daemon for correct interruption handling
 - Support for multiple profiling methods (docker, psutil)
-- Statistics collection and graph generation refactored
+- Statistics collection refactored to use data points structure
 
 ### Known Considerations
 
 - Docker profiling requires containers with proper compose labels
 - Thread join timeout is 2.0 seconds (may need adjustment for slow systems)
 - Plot colors are limited to 6 (cycles after that)
-- Timestamps are ISO format strings for JSON serialization
+- Timestamps are ISO format strings with 'Z' suffix (UTC timezone)
+- NDJSON output: each line is a separate JSON object (not a single JSON array)
+- Run ID is auto-generated if not provided (format: `run-YYYYMMDD-HHMMSS`)
 
 ## Quick Reference
 
@@ -442,6 +502,12 @@ vedro run tests/
 
 # Run with profiling
 vedro run tests/ --enable-profiling --draw-plots
+
+# Run with custom run ID
+vedro run tests/ --enable-profiling --run-id my-test-123
+
+# Process NDJSON output
+cat .profiling/profiling.ndjson | jq -c 'select(.type=="Point")'
 ```
 
 ---
