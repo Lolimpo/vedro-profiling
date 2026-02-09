@@ -3,7 +3,7 @@ import os
 import threading
 import warnings
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Type, TypedDict
 
 import docker
@@ -105,7 +105,7 @@ class VedroProfilingPlugin(Plugin):
     ) -> DataPoint:
         """Create a standardized data point for profiling metrics."""
         if timestamp is None:
-            timestamp = datetime.now().isoformat() + "Z"
+            timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         
         return {
             "type": "Point",
@@ -155,7 +155,7 @@ class VedroProfilingPlugin(Plugin):
                     system_delta = (stats["cpu_stats"]["system_cpu_usage"] -
                                     stats["precpu_stats"]["system_cpu_usage"])
 
-                    timestamp = datetime.now().isoformat() + "Z"
+                    timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                     container_name = container.name or "unknown"
                     
                     if system_delta > 0 and stats["cpu_stats"].get("online_cpus"):
@@ -202,7 +202,7 @@ class VedroProfilingPlugin(Plugin):
                 system_cpu = psutil.cpu_percent()
                 system_mem = psutil.virtual_memory().used / 1e6  # Memory in MB
 
-                timestamp = datetime.now().isoformat() + "Z"
+                timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 proc_name = proc.name() or "unknown"
 
                 # Process CPU point
