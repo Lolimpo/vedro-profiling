@@ -14,6 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed"
 ]
 dependencies = [
@@ -25,10 +26,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "types-docker==7.1.0.20251009",
-    "mypy==1.18.2",
-    "ruff==0.14.4",
-    "types-psutil==7.0.0.20251111",
+    "mypy==1.19.1",
+    "ruff==0.14.13",
+    "types-psutil==7.2.1.20260116",
+    "types-docker==7.1.0.20260109",
 ]
 
 [project.urls]
